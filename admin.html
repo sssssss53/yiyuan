@@ -1,0 +1,92 @@
+import {
+  PLANS, ensureSchema, now, normalizeEmail, isAllowedEmail, json, readJson,
+  hashPassword, verifyPassword, signToken, cookieHeader, clearCookieHeader,
+  uuid, requireUser, getUserFromRequest
+} from '../_lib.js';
+
+export async function onRequest(context) {
+  const { request, env, params } = context;
+  const path = '/' + ((params.path || []).join('/'));
+  const method = request.method.toUpperCase();
+
+  try {
+    await ensureSchema(env);
+
+    if (method === 'GET' && path === '/plans') {
+      return json({ plans: PLANS });
+    }
+
+    if (method === 'POST' && path === '/register') {
+      const body = await readJson(request);
+      const email = normalizeEmail(body.email);
+      const password = String(body.password || '');
+      if (!isAllowedEmail(email)) return json({ error: '邮箱只支持 Gmail、QQ、Foxmail、163。' }, 400);
+      if (password.length < 8) return json({ error: '密码最短 8 位。' }, 400);
+
+      const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+      if (existing) return json({ error: '该邮箱已注册，请直接登录。' }, 409);
+
+      const id = uuid();
+      const createdAt = now();
+      const passwordHash = await hashPassword(password);
+      await env.DB.prepare('INSERT INTO users (id, email, password_hash, created_at, last_login_at) VALUES (?, ?, ?, ?, NULL)')
+        .bind(id, email, passwordHash, createdAt).run();
+      return json({ ok: true, message: '注册成功，请切换到老用户登录。' });
+    }
+
+    if (method === 'POST' && path === '/login') {
+      const body = await readJson(request);
+      const email = normalizeEmail(body.email);
+      const password = String(body.password || '');
+      const user = await env.DB.prepare('SELECT id, email, password_hash AS passwordHash, created_at AS createdAt, last_login_at AS lastLoginAt FROM users WHERE email = ?').bind(email).first();
+      if (!user || !(await verifyPassword(password, user.passwordHash))) {
+        return json({ error: '账号或密码不正确。' }, 401);
+      }
+      const lastLoginAt = now();
+      await env.DB.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').bind(lastLoginAt, user.id).run();
+      const token = await signToken(env, { userId: user.id }, 7 * 24 * 60 * 60);
+      return json({ ok: true, user: { id: user.id, email: user.email, createdAt: user.createdAt, lastLoginAt } }, 200, {
+        'Set-Cookie': cookieHeader(request, 'yyj_user', token, 7 * 24 * 60 * 60)
+      });
+    }
+
+    if (method === 'POST' && path === '/logout') {
+      return json({ ok: true }, 200, { 'Set-Cookie': clearCookieHeader(request, 'yyj_user') });
+    }
+
+    if (method === 'GET' && path === '/me') {
+      const user = await getUserFromRequest(request, env);
+      return json({ user: user ? { id: user.id, email: user.email, createdAt: user.createdAt, lastLoginAt: user.lastLoginAt || null } : null });
+    }
+
+    if (method === 'POST' && path === '/orders') {
+      const auth = await requireUser(request, env);
+      if (auth.error) return auth.error;
+      const body = await readJson(request);
+      const planKey = String(body.plan || '');
+      const plan = PLANS[planKey];
+      if (!plan) return json({ error: '套餐不存在。' }, 400);
+      const id = uuid();
+      const createdAt = now();
+      await env.DB.prepare(`
+        INSERT INTO orders (id, user_id, email, plan, plan_name, amount, status, created_at, paid_at, node_text, node_sent_at, email_send_status, email_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, NULL)
+      `).bind(id, auth.user.id, auth.user.email, planKey, plan.name, plan.amount, '正在开通线路', createdAt, createdAt).run();
+      return json({ ok: true, order: { id, userId: auth.user.id, email: auth.user.email, plan: planKey, planName: plan.name, amount: plan.amount, status: '正在开通线路', createdAt, paidAt: createdAt } });
+    }
+
+    if (method === 'GET' && path === '/my-orders') {
+      const auth = await requireUser(request, env);
+      if (auth.error) return auth.error;
+      const { results } = await env.DB.prepare(`
+        SELECT id, plan_name AS planName, amount, status, created_at AS createdAt, node_sent_at AS nodeSentAt, node_text AS nodeText
+        FROM orders WHERE user_id = ? ORDER BY created_at DESC
+      `).bind(auth.user.id).all();
+      return json({ orders: results || [] });
+    }
+
+    return json({ error: 'Not found' }, 404);
+  } catch (err) {
+    return json({ error: err.message || '服务器错误' }, 500);
+  }
+}

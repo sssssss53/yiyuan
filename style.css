@@ -1,0 +1,59 @@
+import {
+  ensureSchema, now, json, readJson, signToken, cookieHeader, clearCookieHeader,
+  requireAdmin
+} from '../../_lib.js';
+
+export async function onRequest(context) {
+  const { request, env, params } = context;
+  const path = '/' + ((params.path || []).join('/'));
+  const method = request.method.toUpperCase();
+
+  try {
+    await ensureSchema(env);
+
+    if (method === 'POST' && path === '/login') {
+      const body = await readJson(request);
+      const password = String(body.password || '');
+      if (!env.ADMIN_PASSWORD) return json({ error: '缺少 ADMIN_PASSWORD 环境变量。' }, 500);
+      if (password !== env.ADMIN_PASSWORD) return json({ error: '管理员密码不正确。' }, 401);
+      const token = await signToken(env, { admin: true }, 12 * 60 * 60);
+      return json({ ok: true }, 200, { 'Set-Cookie': cookieHeader(request, 'yyj_admin', token, 12 * 60 * 60) });
+    }
+
+    if (method === 'POST' && path === '/logout') {
+      return json({ ok: true }, 200, { 'Set-Cookie': clearCookieHeader(request, 'yyj_admin') });
+    }
+
+    const auth = await requireAdmin(request, env);
+    if (auth.error) return auth.error;
+
+    if (method === 'GET' && path === '/state') {
+      const users = await env.DB.prepare('SELECT id, email, created_at AS createdAt, last_login_at AS lastLoginAt FROM users ORDER BY created_at DESC').all();
+      const orders = await env.DB.prepare(`
+        SELECT id, user_id AS userId, email, plan, plan_name AS planName, amount, status, created_at AS createdAt,
+               paid_at AS paidAt, node_text AS nodeText, node_sent_at AS nodeSentAt, email_send_status AS emailSendStatus, email_error AS emailError
+        FROM orders ORDER BY created_at DESC
+      `).all();
+      return json({ users: users.results || [], orders: orders.results || [] });
+    }
+
+    const sendNodeMatch = path.match(/^\/orders\/([^/]+)\/send-node$/);
+    if (method === 'POST' && sendNodeMatch) {
+      const orderId = sendNodeMatch[1];
+      const body = await readJson(request);
+      const nodeText = String(body.nodeText || '').trim();
+      if (!nodeText) return json({ error: '请填写节点内容。' }, 400);
+      const existing = await env.DB.prepare('SELECT id FROM orders WHERE id = ?').bind(orderId).first();
+      if (!existing) return json({ error: '订单不存在。' }, 404);
+      const sentAt = now();
+      await env.DB.prepare(`
+        UPDATE orders SET node_text = ?, status = ?, node_sent_at = ?, email_send_status = ?, email_error = ? WHERE id = ?
+      `).bind(nodeText, '已开通', sentAt, 'saved', 'Cloudflare Pages 版本未配置邮件服务，节点已保存，用户登录后可查看。', orderId).run();
+      return json({ ok: true, message: '节点已保存。Cloudflare Pages 版本未配置邮件服务，用户登录后可查看。' });
+    }
+
+    return json({ error: 'Not found' }, 404);
+  } catch (err) {
+    return json({ error: err.message || '服务器错误' }, 500);
+  }
+}
